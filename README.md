@@ -75,6 +75,7 @@ Run `minicast set --help` for every flag.
 
 - **Bitrate.** Pin one with `--bitrate`. 6000 kbps suits 1080p60. `--bitrate auto` measures your upload speed, but the probe is noisy, so it is off by default.
 - **Low bitrate warning on YouTube.** VideoToolbox encodes a mostly static screen well below the target bitrate. The warning is harmless. `--encoder x264` pads to a constant bitrate if you want it gone, at a higher CPU cost.
+- **Screen fit.** The default, `--screen-fit match`, sizes the stream to your screen's aspect ratio, so nothing is cropped and there are no black bars. A 16:9 monitor streams 1920x1080, a 16:10 MacBook screen 1660x1080. `cover` fills a fixed 16:9 canvas and crops the edges, `contain` letterboxes.
 - **Frame rate.** 60 is the most RTMP platforms accept, even on a 100 Hz or 120 Hz display.
 - **Config and logs** live in `~/.config/minicast/`. Config edits never affect a running stream; each start takes a snapshot. The config file holds your stream key, so keep it private.
 - **Stop streams with** `minicast stream stop`, not by killing ffmpeg. The supervisor would restart it.

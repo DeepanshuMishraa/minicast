@@ -54,7 +54,7 @@ enum Cmd {
         /// Screen device index or name, e.g. "1" or "Capture screen 0"
         #[arg(long)]
         screen: Option<String>,
-        /// Screen fit: cover (fill, crop, no black bars) | contain (letterbox)
+        /// Screen fit: match (canvas follows screen aspect, default) | cover (fill, crop) | contain (letterbox)
         #[arg(long)]
         screen_fit: Option<String>,
         /// Capture cursor: true | false
@@ -356,8 +356,8 @@ fn main() -> Result<()> {
 
             if let Some(v) = screen_fit.as_deref() {
                 match v.to_lowercase().as_str() {
-                    "cover" | "contain" => cfg.screen.fit = v.to_lowercase(),
-                    _ => bail!("--screen-fit must be cover|contain"),
+                    "match" | "cover" | "contain" => cfg.screen.fit = v.to_lowercase(),
+                    _ => bail!("--screen-fit must be match|cover|contain"),
                 }
             }
             if let Some(v) = cursor.as_deref() {

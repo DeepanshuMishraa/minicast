@@ -107,9 +107,11 @@ pub struct ScreenConfig {
     pub video_device: String,
     #[serde(default = "d_true")]
     pub capture_cursor: bool,
-    /// cover = fill canvas exactly, crop overflow (no black bars, default).
+    /// match = size the canvas to the screen's own aspect (default): nothing
+    /// cropped, no black bars; 16:9 screens come out 1920x1080 as before.
+    /// cover = fill a fixed canvas, crop overflow (cuts edges on 16:10).
     /// contain = fit inside canvas, letterbox/pillarbox with black bars.
-    #[serde(default = "d_cover")]
+    #[serde(default = "d_match")]
     pub fit: String,
 }
 
@@ -194,7 +196,7 @@ impl Default for ScreenConfig {
         Self {
             video_device: "4".into(),
             capture_cursor: true,
-            fit: "cover".into(),
+            fit: "match".into(),
         }
     }
 }
@@ -234,7 +236,7 @@ fn d20() -> i32 { 20 }
 fn d_videotoolbox() -> String { "videotoolbox".into() }
 fn d_veryfast() -> String { "veryfast".into() }
 fn d_br() -> String { "bottom-right".into() }
-fn d_cover() -> String { "cover".into() }
+fn d_match() -> String { "match".into() }
 fn d_standard() -> String { "standard".into() }
 fn d_retry_delay() -> u64 { 2 }
 fn d_max_retry_delay() -> u64 { 30 }
@@ -322,8 +324,8 @@ impl Config {
             other => bail!("video.encoder must be videotoolbox|x264, got {other:?}"),
         }
         match self.screen.fit.as_str() {
-            "cover" | "contain" => {}
-            other => bail!("screen.fit must be cover|contain, got {other:?}"),
+            "match" | "cover" | "contain" => {}
+            other => bail!("screen.fit must be match|cover|contain, got {other:?}"),
         }
         match self.camera.filter.as_str() {
             "off" | "standard" | "studio" | "lowlight" => {}

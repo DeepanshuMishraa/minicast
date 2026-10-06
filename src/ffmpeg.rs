@@ -19,6 +19,16 @@ const VIDEO_QUEUE: &str = "32";
 /// fails.
 pub fn resolve_media(cfg: &mut Config) -> Result<()> {
     resolve_devices(cfg)?;
+    if cfg.screen.fit == "match" {
+        match crate::devices::screen_size(&cfg.screen.video_device) {
+            Some(size) => cfg.video.width = matched_width(cfg.video.height, size),
+            None => eprintln!(
+                "warning: could not read the screen size, keeping {}x{} (edges may be cropped). \
+                 Check screen recording permission for your terminal.",
+                cfg.video.width, cfg.video.height
+            ),
+        }
+    }
     if cfg.video.fps_auto {
         let screen_no = crate::devices::probe_avfoundation()
             .ok()
@@ -65,6 +75,13 @@ pub fn resolve_media(cfg: &mut Config) -> Result<()> {
         }
     };
     Ok(())
+}
+
+/// Canvas width for `height` that matches the screen's aspect, rounded to an
+/// even number (H.264 yuv420p needs it). 3584x2016 -> 1920, 2940x1912 -> 1660.
+fn matched_width(height: u32, (sw, sh): (u32, u32)) -> u32 {
+    let w = (height as f64 * sw as f64 / sh as f64 / 2.0).round() as u32 * 2;
+    w.max(2)
 }
 
 /// Turn the configured devices (names, or legacy numeric IDs) into the
@@ -649,6 +666,13 @@ mod tests {
         assert!(joined.contains("crop=1920:1080"), "{joined}");
         assert!(joined.contains("overlay="), "expected overlay filter: {joined}");
         assert!(joined.contains("-capture_cursor"), "{joined}");
+    }
+
+    #[test]
+    fn match_fit_follows_the_screen_aspect() {
+        assert_eq!(matched_width(1080, (3584, 2016)), 1920); // 16:9 monitor unchanged
+        assert_eq!(matched_width(1080, (2560, 1664)), 1662); // 16:10 MacBook
+        assert_eq!(matched_width(1080, (2940, 1912)) % 2, 0);
     }
 
     #[test]

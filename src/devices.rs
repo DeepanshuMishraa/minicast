@@ -220,6 +220,25 @@ pub fn display_refresh_rates() -> Vec<u32> {
     rates
 }
 
+/// Pixel size of a screen capture device (e.g. "5"), read from the stream
+/// line ffmpeg prints when it opens the device.
+pub fn screen_size(device: &str) -> Option<(u32, u32)> {
+    let out = Command::new("ffmpeg")
+        .args(["-hide_banner", "-f", "avfoundation", "-pixel_format", "uyvy422", "-framerate", "30", "-i"])
+        .arg(format!("{device}:"))
+        .args(["-frames:v", "1", "-f", "null", "-"])
+        .output()
+        .ok()?;
+    parse_screen_size(&String::from_utf8_lossy(&out.stderr))
+}
+
+fn parse_screen_size(log: &str) -> Option<(u32, u32)> {
+    log.lines()
+        .filter(|l| l.contains("Stream #0:0") && l.contains("Video:"))
+        .flat_map(|l| l.split([' ', ',']))
+        .find_map(crate::config::parse_size)
+}
+
 fn parse_hz(s: &str) -> Option<u32> {
     s.trim().trim_end_matches("Hz").trim().parse::<f64>().ok().map(|f| f.round() as u32)
 }
