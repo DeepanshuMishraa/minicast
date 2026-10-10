@@ -13,7 +13,7 @@ const PROBE_TIMEOUT_SECS: &str = "15";
 /// buffer.
 const UPLINK_SHARE: f64 = 0.6;
 const AUDIO_KBPS: f64 = 160.0;
-const MIN_AUTO_KBPS: u32 = 4000;
+const MIN_AUTO_KBPS: u32 = 1500;
 /// Bits per pixel per frame that look good in H.264 live encoding.
 const BITS_PER_PIXEL: f64 = 0.07;
 
@@ -71,7 +71,7 @@ mod tests {
         // Fast line -> quality ceiling wins.
         assert_eq!(pick_kbps(50_000.0, 8709), 8709);
         // Slow or under-read line -> floor, not zero.
-        assert_eq!(pick_kbps(1000.0, 8709), 4000);
+        assert_eq!(pick_kbps(1000.0, 8709), 1500);
         // Floor never exceeds the ceiling.
         assert_eq!(pick_kbps(1000.0, 1000), 1000);
     }

@@ -75,10 +75,12 @@ Run `minicast set --help` for every flag.
 
 - **Bitrate.** Pin one with `--bitrate`. 6000 kbps suits 1080p60. `--bitrate auto` measures your upload speed, but the probe is noisy, so it is off by default.
 - **Low bitrate warning on YouTube.** VideoToolbox encodes a mostly static screen well below the target bitrate. The warning is harmless. `--encoder x264` pads to a constant bitrate if you want it gone, at a higher CPU cost.
-- **Screen fit.** The default, `--screen-fit match`, sizes the stream to your screen's aspect ratio, so nothing is cropped and there are no black bars. A 16:9 monitor streams 1920x1080, a 16:10 MacBook screen 1660x1080. `cover` fills a fixed 16:9 canvas and crops the edges, `contain` letterboxes.
+- **Screen fit.** The default, `--screen-fit match`, sizes the stream to your screen's aspect ratio, so nothing is cropped and there are no black bars. A 16:9 monitor streams 1920x1080, a 16:10 MacBook screen 1660x1080. `blur` keeps a 16:9 canvas, shows the whole screen undistorted and fills the sides with a blurred copy, so YouTube's player shows no bars either. `cover` fills a fixed 16:9 canvas and crops the edges, `contain` letterboxes.
+- **Stream key on screen.** In the foreground, ffmpeg prints your full stream key in the terminal. If that screen is on stream, use `minicast start --detach` instead.
 - **Frame rate.** 60 is the most RTMP platforms accept, even on a 100 Hz or 120 Hz display.
 - **Config and logs** live in `~/.config/minicast/`. Config edits never affect a running stream; each start takes a snapshot. The config file holds your stream key, so keep it private.
 - **Stop streams with** `minicast stream stop`, not by killing ffmpeg. The supervisor would restart it.
+- **GUI.** Build with `cargo install --path . --features gui`, then run `minicast gui`. It previews the canvas at native resolution, picks screen, camera and mic, shows the mic level, and starts or ends streams. While live, camera position and size and the mic and system levels change without a reconnect. Fit, devices, camera on/off and system sound on/off wait for "Apply changes", which reconnects once. Streams started before the GUI existed, or from a terminal without `--detach`, can't be edited live.
 
 ## License
 

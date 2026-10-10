@@ -169,6 +169,12 @@ pub struct AudioConfig {
     /// Optional second source for system audio (e.g. "BlackHole 2ch"). Empty = disabled.
     #[serde(default)]
     pub system_device: String,
+    /// Mic level in dB (0 = untouched). Applied before the limiter.
+    #[serde(default)]
+    pub mic_gain_db: f32,
+    /// System audio level in dB (0 = untouched).
+    #[serde(default)]
+    pub system_gain_db: f32,
     /// Lossless mic helper prepared for this run (see `mic`); never persisted.
     /// None = capture the mic through ffmpeg's own avfoundation input.
     #[serde(skip)]
@@ -222,7 +228,7 @@ impl Default for CameraConfig {
 
 impl Default for AudioConfig {
     fn default() -> Self {
-        Self { mic_device: String::new(), mic_mode: "standard".into(), system_device: String::new(), mic_capture: None }
+        Self { mic_device: String::new(), mic_mode: "standard".into(), system_device: String::new(), mic_gain_db: 0.0, system_gain_db: 0.0, mic_capture: None }
     }
 }
 
@@ -324,8 +330,8 @@ impl Config {
             other => bail!("video.encoder must be videotoolbox|x264, got {other:?}"),
         }
         match self.screen.fit.as_str() {
-            "match" | "cover" | "contain" => {}
-            other => bail!("screen.fit must be match|cover|contain, got {other:?}"),
+            "match" | "stretch" | "blur" | "cover" | "contain" => {}
+            other => bail!("screen.fit must be match|stretch|blur|cover|contain, got {other:?}"),
         }
         match self.camera.filter.as_str() {
             "off" | "standard" | "studio" | "lowlight" => {}
@@ -343,6 +349,11 @@ impl Config {
             other => bail!(
                 "audio.mic_mode must be standard|voice|wide, got {other:?}"
             ),
+        }
+        for (name, db) in [("audio.mic_gain_db", self.audio.mic_gain_db), ("audio.system_gain_db", self.audio.system_gain_db)] {
+            if !(-30.0..=30.0).contains(&db) {
+                bail!("{name} must be between -30 and 30 dB, got {db}");
+            }
         }
         if self.output.retry_delay_secs == 0 {
             bail!("output.retry_delay_secs must be >= 1 (got 0)");

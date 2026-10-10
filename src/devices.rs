@@ -1,17 +1,92 @@
 use anyhow::Result;
-use std::process::Command;
+use std::any::Any;
+use std::collections::HashMap;
+use std::io::Read;
+use std::sync::Mutex;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
+
+/// How long a capture-device probe may run. A probe that cannot open a busy
+/// device otherwise hangs forever and keeps the device claimed.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Probe results kept for the life of a long-running process (the GUI), where
+/// each probe costs about a second of ffmpeg startup. Off for the CLI, whose
+/// device lookup deliberately re-probes while macOS settles.
+static PROBE_CACHE: Mutex<Option<HashMap<String, Box<dyn Any + Send>>>> = Mutex::new(None);
+
+pub fn enable_probe_cache() {
+    *lock_cache() = Some(HashMap::new());
+}
+
+/// Drop cached probes so the next lookup sees devices plugged in or removed.
+pub fn forget_probes() {
+    if let Some(map) = lock_cache().as_mut() {
+        map.clear();
+    }
+}
+
+fn lock_cache() -> std::sync::MutexGuard<'static, Option<HashMap<String, Box<dyn Any + Send>>>> {
+    PROBE_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn cache_get<T: Clone + 'static>(key: &str) -> Option<T> {
+    lock_cache().as_ref()?.get(key)?.downcast_ref::<T>().cloned()
+}
+
+fn cache_put<T: Send + 'static>(key: &str, value: T) {
+    if let Some(map) = lock_cache().as_mut() {
+        map.insert(key.to_string(), Box::new(value));
+    }
+}
+
+/// Like `Command::output`, but kills the child after `limit`. Returns `None`
+/// on timeout or spawn failure. Only stderr is captured (all probes read it).
+fn output_within(cmd: &mut Command, limit: Duration) -> Option<Output> {
+    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().ok()?;
+    let mut stderr = child.stderr.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        buf
+    });
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        if let Some(status) = child.try_wait().ok()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    Some(Output { status, stdout: Vec::new(), stderr: reader.join().ok()? })
+}
 
 /// Parsed AVFoundation device list from ffmpeg output.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct DeviceList {
     pub video: Vec<(String, String)>,
     pub audio: Vec<(String, String)>,
 }
 
 pub fn probe_avfoundation() -> Result<DeviceList> {
-    let out = Command::new("ffmpeg")
-        .args(["-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""])
-        .output()?;
+    if let Some(list) = cache_get::<DeviceList>("list") {
+        return Ok(list);
+    }
+    let list = probe_avfoundation_uncached()?;
+    cache_put("list", list.clone());
+    Ok(list)
+}
+
+fn probe_avfoundation_uncached() -> Result<DeviceList> {
+    let out = output_within(
+        Command::new("ffmpeg").args(["-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""]),
+        PROBE_TIMEOUT,
+    )
+    .ok_or_else(|| anyhow::anyhow!("ffmpeg did not list devices within {}s (is ffmpeg installed, and is a capture app stuck?)", PROBE_TIMEOUT.as_secs()))?;
     // ffmpeg writes the list to stderr and exits non-zero; that's expected.
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     Ok(parse_avfoundation(&stderr))
@@ -176,12 +251,25 @@ mod tests {
 /// Modes a camera advertises, as (w, h, fps list). Asks AVFoundation for an
 /// impossible size; it answers with its "Supported modes" list on stderr.
 pub fn camera_modes(device: &str) -> Vec<(u32, u32, Vec<f64>)> {
-    let Ok(out) = Command::new("ffmpeg")
-        .args(["-hide_banner", "-f", "avfoundation", "-video_size", "1x1", "-framerate", "30", "-i"])
-        .arg(format!("{device}:"))
-        .args(["-t", "1", "-f", "null", "-"])
-        .output()
-    else {
+    let key = format!("camera:{device}");
+    if let Some(modes) = cache_get(&key) {
+        return modes;
+    }
+    let modes = camera_modes_uncached(device);
+    if !modes.is_empty() {
+        cache_put(&key, modes.clone());
+    }
+    modes
+}
+
+fn camera_modes_uncached(device: &str) -> Vec<(u32, u32, Vec<f64>)> {
+    let Some(out) = output_within(
+        Command::new("ffmpeg")
+            .args(["-hide_banner", "-f", "avfoundation", "-video_size", "1x1", "-framerate", "30", "-i"])
+            .arg(format!("{device}:"))
+            .args(["-t", "1", "-f", "null", "-"]),
+        PROBE_TIMEOUT,
+    ) else {
         return Vec::new();
     };
     parse_modes(&String::from_utf8_lossy(&out.stderr))
@@ -223,12 +311,23 @@ pub fn display_refresh_rates() -> Vec<u32> {
 /// Pixel size of a screen capture device (e.g. "5"), read from the stream
 /// line ffmpeg prints when it opens the device.
 pub fn screen_size(device: &str) -> Option<(u32, u32)> {
-    let out = Command::new("ffmpeg")
-        .args(["-hide_banner", "-f", "avfoundation", "-pixel_format", "uyvy422", "-framerate", "30", "-i"])
-        .arg(format!("{device}:"))
-        .args(["-frames:v", "1", "-f", "null", "-"])
-        .output()
-        .ok()?;
+    let key = format!("screen:{device}");
+    if let Some(size) = cache_get(&key) {
+        return Some(size);
+    }
+    let size = screen_size_uncached(device)?;
+    cache_put(&key, size);
+    Some(size)
+}
+
+fn screen_size_uncached(device: &str) -> Option<(u32, u32)> {
+    let out = output_within(
+        Command::new("ffmpeg")
+            .args(["-hide_banner", "-f", "avfoundation", "-pixel_format", "uyvy422", "-framerate", "30", "-i"])
+            .arg(format!("{device}:"))
+            .args(["-frames:v", "1", "-f", "null", "-"]),
+        PROBE_TIMEOUT,
+    )?;
     parse_screen_size(&String::from_utf8_lossy(&out.stderr))
 }
 
@@ -301,5 +400,19 @@ mod mode_tests {
     fn parses_refresh_rate() {
         assert_eq!(parse_hz(" 100.00Hz"), Some(100));
         assert_eq!(parse_hz("59.94Hz"), Some(60));
+    }
+
+    #[test]
+    fn a_hung_probe_is_killed_at_the_deadline() {
+        let started = Instant::now();
+        let out = output_within(Command::new("sleep").arg("30"), Duration::from_millis(200));
+        assert!(out.is_none());
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_finished_probe_returns_its_stderr() {
+        let out = output_within(Command::new("sh").args(["-c", "echo boom >&2"]), Duration::from_secs(5));
+        assert_eq!(String::from_utf8_lossy(&out.unwrap().stderr).trim(), "boom");
     }
 }

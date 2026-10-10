@@ -3,7 +3,9 @@ use crate::config::Config;
 use crate::mic::MicCapture;
 use anyhow::{Context, Result, anyhow};
 use std::os::unix::process::ExitStatusExt;
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 /// Packet queue depth for raw video inputs (see the inputs comment in `build_argv`).
 /// 32 frames ≈ 0.5 s at 60 fps / 1 s at 30 fps of raw Retina frames (~14 MB
@@ -179,6 +181,21 @@ fn base_video_filter(cfg: &Config, src: &str, dst: &str) -> String {
     // encoder starves (dropped frames + CFR duplicates = 0.5x look).
     // Bilinear is visually identical for a live screen downscale.
     match cfg.screen.fit.as_str() {
+        // Whole screen stretched to the 16:9 canvas: no bars, nothing cropped.
+        // A 16:10 screen comes out ~11% wider than real (the only way to fill
+        // a 16:9 player without cutting edges).
+        "stretch" => format!(
+            "[{src}]{rb}scale={w}:{h}:flags=bilinear,setsar=1,fps={fps}[{dst}]"
+        ),
+        // Whole screen, undistorted, centered on the fixed canvas; the side
+        // bars are a blurred copy of the screen instead of black. The blur
+        // runs on a 192x108 thumbnail, so it costs almost nothing.
+        "blur" => format!(
+            "[{src}]{rb}split[bg0][fg0];\
+             [bg0]scale=192:108:flags=bilinear,boxblur=3:2,scale={w}:{h}:flags=bilinear,setsar=1[bg];\
+             [fg0]scale={w}:{h}:flags=bilinear:force_original_aspect_ratio=decrease,setsar=1[fg];\
+             [bg][fg]overlay=(W-w)/2:(H-h)/2,fps={fps}[{dst}]"
+        ),
         "contain" => format!(
             "[{src}]{rb}scale={w}:{h}:flags=bilinear:force_original_aspect_ratio=decrease,\
              pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,\
@@ -203,8 +220,8 @@ fn camera_filter(cfg: &Config) -> String {
     // light) so the overlay never waits on an irregular second input.
     // flags=bilinear keeps the PiP scale cheap too.
     format!(
-        "[1:v]{}scale={cw}:{ch}:flags=bilinear:force_original_aspect_ratio=increase,\
-         crop={cw}:{ch},setsar=1,fps={fps}{}[cam]",
+        "[1:v]{}scale@cam={cw}:{ch}:flags=bilinear:force_original_aspect_ratio=increase,\
+         crop@cam={cw}:{ch},setsar=1,fps={fps}{}[cam]",
         rebase(cfg, "setpts"),
         camera_fx(&cfg.camera.filter)
     )
@@ -239,7 +256,9 @@ fn camera_fx(filter: &str) -> String {
 /// - standard: transparent, nothing removed.
 /// - voice: Voice-Isolation-like — FFT noise suppression + gentle leveling.
 /// - wide: music-friendly — full background kept, no suppression/compression.
-fn mic_chain(mode: &str, piped: bool) -> String {
+///
+/// `gain_db` is the user level; it sits before the limiter so boosts can't clip.
+fn mic_chain(mode: &str, piped: bool, gain_db: f32) -> String {
     // Soft async: only hard-stretch gaps >100 ms (dropouts), small clock
     // drift is absorbed by smooth resampling — hard stretching is what
     // clicks and crackles. The helper's pipe is already gap-free 48 kHz on
@@ -250,8 +269,10 @@ fn mic_chain(mode: &str, piped: bool) -> String {
     } else {
         "aresample=48000:async=1:min_hard_comp=0.100:first_pts=0"
     };
-    let out = "aformat=sample_rates=48000:channel_layouts=stereo,\
-               alimiter=limit=0.95:level=disabled";
+    let out = format!(
+        "{}aformat=sample_rates=48000:channel_layouts=stereo,alimiter=limit=0.95:level=disabled",
+        gain_filter("mic", gain_db)
+    );
     match mode {
         "voice" => format!(
             "{src},highpass=f=80,afftdn=nf=-25:nr=12,\
@@ -262,19 +283,27 @@ fn mic_chain(mode: &str, piped: bool) -> String {
     }
 }
 
+/// Named `volume@<name>` filter with a trailing comma. It is always present,
+/// even at 0 dB, so a live command can change the level without a restart.
+fn gain_filter(name: &str, db: f32) -> String {
+    format!("volume@{name}={db}dB,")
+}
+
 /// Transparent chain for system audio (never denoise music/desktop sound).
 fn system_chain(cfg: &Config) -> String {
+    let gain = gain_filter("sys", cfg.audio.system_gain_db);
     // Next to the mic helper, keep the device's host-clock stamps (re-based
     // onto the helper's origin) instead of resetting them to zero.
     if cfg.audio.mic_capture.is_some() {
         format!(
-            "{}aresample=48000,aformat=sample_rates=48000:channel_layouts=stereo",
+            "{}aresample=48000,{gain}aformat=sample_rates=48000:channel_layouts=stereo",
             rebase(cfg, "asetpts")
         )
     } else {
-        "aresample=48000:async=1:min_hard_comp=0.100:first_pts=0,\
-         aformat=sample_rates=48000:channel_layouts=stereo"
-            .to_string()
+        format!(
+            "aresample=48000:async=1:min_hard_comp=0.100:first_pts=0,{gain}\
+             aformat=sample_rates=48000:channel_layouts=stereo"
+        )
     }
 }
 
@@ -293,6 +322,71 @@ fn mic_input(cfg: &Config) -> Vec<String> {
     v
 }
 
+/// Push the screen (0:v) and optional camera (1:v) inputs and return the
+/// filtergraph that composes them into `[video]`. Shared by the stream and
+/// the GUI preview so both show exactly the same picture.
+fn video_inputs(cfg: &Config, fps: u32, args: &mut Vec<String>) -> String {
+    let (cam_x, cam_y) = cfg.camera_xy();
+    let cursor = if cfg.screen.capture_cursor { "1" } else { "0" };
+    // Video queues are sized to ride out encode hiccups: a raw Retina frame
+    // is ~14 MB, so VIDEO_QUEUE=32 bounds worst-case RAM (~450 MB) while
+    // holding ~0.5-1 s. Shallower (8) drops on any hiccup; with CFR output
+    // each drop is a duplicated frame, which viewers see as half-speed motion
+    // and which compresses to nothing, so YouTube reports a very low bitrate
+    // even on excellent upload.
+    args.extend([
+        "-thread_queue_size".into(),
+        VIDEO_QUEUE.into(),
+        "-f".into(),
+        "avfoundation".into(),
+        "-capture_cursor".into(),
+        cursor.into(),
+        // Native uyvy422 avoids a pixel-format override. -framerate IS
+        // honored (measured: 30/60 -> ~30/58 fps) despite the harmless
+        // "Configuration of video device failed" warning; without it the
+        // device defaults to 30.
+        "-pixel_format".into(),
+        "uyvy422".into(),
+        "-framerate".into(),
+        fps.to_string(),
+        "-i".into(),
+        format!("{}:", cfg.screen.video_device),
+    ]);
+
+    if !cfg.camera.enabled {
+        return base_video_filter(cfg, "0:v", "video");
+    }
+    args.extend([
+        "-thread_queue_size".into(),
+        VIDEO_QUEUE.into(),
+        "-f".into(),
+        "avfoundation".into(),
+        // Request an explicit mode: without it macOS picks its own
+        // default (e.g. 1080x1920 portrait, unclocked), heavy and choppy.
+        // The mode comes from the device itself (or camera.capture_size).
+        "-pixel_format".into(),
+        "uyvy422".into(),
+    ]);
+    // Camera rate: what the device actually offers (<= stream fps); the
+    // camera filter chain then duplicates up to the stream fps.
+    let mut cam_fps = fps;
+    if let Some((mw, mh, cf)) = cfg.camera.capture_mode {
+        args.extend(["-video_size".into(), format!("{mw}x{mh}")]);
+        cam_fps = cf;
+    }
+    args.extend([
+        "-framerate".into(),
+        cam_fps.to_string(),
+        "-i".into(),
+        format!("{}:", cfg.camera.video_device),
+    ]);
+    format!(
+        "{};{};[base][cam]overlay@cam={cam_x}:{cam_y}:format=yuv420[video]",
+        base_video_filter(cfg, "0:v", "base"),
+        camera_filter(cfg)
+    )
+}
+
 /// Build the ffmpeg argv (without the leading "ffmpeg").
 pub fn build_argv(cfg: &Config) -> Result<Vec<String>> {
     let w = cfg.video.width;
@@ -303,8 +397,6 @@ pub fn build_argv(cfg: &Config) -> Result<Vec<String>> {
     // YouTube actually receives), loose enough to absorb a scene cut.
     let buf = br.clone();
     let keyint = cfg.video.keyint_secs.unwrap_or(2) * fps;
-    let (cam_x, cam_y) = cfg.camera_xy();
-    let cursor = if cfg.screen.capture_cursor { "1" } else { "0" };
 
     let mut args: Vec<String> = vec![
         "-hide_banner".into(),
@@ -354,63 +446,8 @@ pub fn build_argv(cfg: &Config) -> Result<Vec<String>> {
     // each drop is a duplicated frame — viewers see half-speed motion and
     // duplicates compress to nothing, so YouTube reports a very low bitrate
     // even on excellent upload. Audio packets are tiny, so those stay deep.
-    // 0:v screen (video-only)
-    args.extend([
-        "-thread_queue_size".into(),
-        VIDEO_QUEUE.into(),
-        "-f".into(),
-        "avfoundation".into(),
-        "-capture_cursor".into(),
-        cursor.into(),
-        // Native uyvy422 avoids a pixel-format override. -framerate IS
-        // honored (measured: 30/60 -> ~30/58 fps) despite the harmless
-        // "Configuration of video device failed" warning; without it the
-        // device defaults to 30.
-        "-pixel_format".into(),
-        "uyvy422".into(),
-        "-framerate".into(),
-        fps.to_string(),
-        "-i".into(),
-        format!("{}:", cfg.screen.video_device),
-    ]);
-
     let video_label = "[video]".to_string();
-    let mut filter = String::new();
-
-    if cfg.camera.enabled {
-        // 1:v camera
-        args.extend([
-            "-thread_queue_size".into(),
-            VIDEO_QUEUE.into(),
-            "-f".into(),
-            "avfoundation".into(),
-            // Request an explicit mode: without it macOS picks its own
-            // default (e.g. 1080x1920 portrait, unclocked), heavy and choppy.
-            // The mode comes from the device itself (or camera.capture_size).
-            "-pixel_format".into(),
-            "uyvy422".into(),
-        ]);
-        // Camera rate: what the device actually offers (<= stream fps); the
-        // camera filter chain then duplicates up to the stream fps.
-        let mut cam_fps = fps;
-        if let Some((mw, mh, cf)) = cfg.camera.capture_mode {
-            args.extend(["-video_size".into(), format!("{mw}x{mh}")]);
-            cam_fps = cf;
-        }
-        args.extend([
-            "-framerate".into(),
-            cam_fps.to_string(),
-            "-i".into(),
-            format!("{}:", cfg.camera.video_device),
-        ]);
-        filter.push_str(&base_video_filter(cfg, "0:v", "base"));
-        filter.push(';');
-        filter.push_str(&camera_filter(cfg));
-        filter.push(';');
-        filter.push_str(&format!("[base][cam]overlay={cam_x}:{cam_y}:format=yuv420[video]"));
-    } else {
-        filter.push_str(&base_video_filter(cfg, "0:v", "video"));
-    }
+    let filter = video_inputs(cfg, fps, &mut args);
 
     // Audio inputs: mic and optional system mix, all at 48 kHz end to end.
     // macOS mics natively deliver 48 kHz — converting to 44.1 kHz and back
@@ -435,13 +472,13 @@ pub fn build_argv(cfg: &Config) -> Result<Vec<String>> {
             "[{mic_idx}:a]{mchain}[m0];[{sys_idx}:a]{schain}[s0];\
              [m0][s0]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0[mix];\
              [mix]alimiter=limit=0.95:level=disabled[audio]",
-            mchain = mic_chain(&cfg.audio.mic_mode, piped_mic),
+            mchain = mic_chain(&cfg.audio.mic_mode, piped_mic, cfg.audio.mic_gain_db),
             schain = system_chain(cfg),
         ));
         audio_label = "[audio]".to_string();
     } else if has_mic || has_sys {
         let chain = if has_mic {
-            mic_chain(&cfg.audio.mic_mode, piped_mic)
+            mic_chain(&cfg.audio.mic_mode, piped_mic, cfg.audio.mic_gain_db)
         } else {
             system_chain(cfg)
         };
@@ -548,12 +585,16 @@ pub fn build_argv(cfg: &Config) -> Result<Vec<String>> {
     // keyframes included), which viewers see as freezes and jumps. Blocking
     // instead pushes back to the shallow capture queues, which drop single
     // frames — graceful slowdown rather than a hole in the stream.
+    // max_recovery_attempts: after ~10 failed re-opens (about 10-20 s) the fifo
+    // gives up, ffmpeg exits non-zero and the supervisor restarts everything.
+    // Unlimited (the default) can wedge in "Recovery failed: Invalid argument"
+    // forever while the process stays up, so nothing ever restarts it.
     // no_duration_filesize keeps FLV metadata sane across reconnects.
     // With a record path, one tee muxer feeds both the fifo'd RTMP output
     // and a fragmented MP4 (playable even if the process is killed) from
     // the SAME encode — no second encode of the raw screen.
     let fifo = "queue_size=150:drop_pkts_on_overflow=0:attempt_recovery=1:\
-                recover_any_error=1:recovery_wait_time=1:restart_with_keyframe=1";
+                max_recovery_attempts=10:recover_any_error=1:recovery_wait_time=1:restart_with_keyframe=1";
     match cfg.output.record_path.as_ref().filter(|p| !p.trim().is_empty()) {
         Some(path) => args.extend([
             // tee can't tell each slave's needs; MP4 requires global headers.
@@ -582,6 +623,8 @@ pub fn build_argv(cfg: &Config) -> Result<Vec<String>> {
             "0".into(),
             "-attempt_recovery".into(),
             "1".into(),
+            "-max_recovery_attempts".into(),
+            "10".into(),
             "-recover_any_error".into(),
             "1".into(),
             "-recovery_wait_time".into(),
@@ -597,6 +640,24 @@ pub fn build_argv(cfg: &Config) -> Result<Vec<String>> {
     Ok(args)
 }
 
+/// Set by Ctrl-C / SIGTERM. The CLI must outlive ffmpeg: if it exits first,
+/// ffmpeg is orphaned and keeps streaming (and holding the camera) unseen.
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+/// How long ffmpeg gets to finish after SIGINT before it is killed. A wedged
+/// output (dead network) can block its graceful shutdown indefinitely.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+pub fn interrupted() -> bool {
+    INTERRUPTED.load(Ordering::SeqCst)
+}
+
+/// Turn Ctrl-C / SIGTERM into a flag that `run_once` acts on, instead of
+/// letting the default handler kill the CLI before ffmpeg has stopped.
+pub fn install_interrupt_handler() -> Result<()> {
+    ctrlc::set_handler(|| INTERRUPTED.store(true, Ordering::SeqCst)).context("failed to install the Ctrl-C handler")
+}
+
 /// Run ffmpeg once and wait for it. With the lossless mic helper, start the
 /// helper on a fresh timeline origin and feed its PCM to ffmpeg's stdin. If
 /// the helper dies first, stop ffmpeg and report failure so the caller's
@@ -604,7 +665,8 @@ pub fn build_argv(cfg: &Config) -> Result<Vec<String>> {
 pub fn run_once(argv: &[String], mic: Option<&MicCapture>) -> Result<ExitStatus> {
     let Some(mic) = mic else {
         eprintln!("$ ffmpeg {}", shell_join(argv));
-        return Ok(Command::new("ffmpeg").args(argv).spawn()?.wait()?);
+        let mut ffmpeg = Command::new("ffmpeg").args(argv).spawn().context("failed to start ffmpeg (is it installed?)")?;
+        return wait_for(&mut ffmpeg, None, interrupted, SHUTDOWN_GRACE);
     };
     let origin = mic.now()?;
     let argv: Vec<String> = argv.iter().map(|a| a.replace(crate::mic::ORIGIN, &origin)).collect();
@@ -619,24 +681,76 @@ pub fn run_once(argv: &[String], mic: Option<&MicCapture>) -> Result<ExitStatus>
             return Err(anyhow!(e).context("failed to start ffmpeg (is it installed?)"));
         }
     };
+    let status = wait_for(&mut ffmpeg, Some(&mut helper), interrupted, SHUTDOWN_GRACE);
+    let _ = helper.kill();
+    let _ = helper.wait();
+    status
+}
+
+/// Wait for `ffmpeg`. When `stop()` turns true, ask it to finish with SIGINT
+/// and kill it after `grace`. When the mic helper dies first, kill ffmpeg and
+/// return exit code 1 so the caller restarts both.
+fn wait_for(
+    ffmpeg: &mut Child,
+    mut helper: Option<&mut Child>,
+    stop: impl Fn() -> bool,
+    grace: Duration,
+) -> Result<ExitStatus> {
+    let mut asked_at: Option<Instant> = None;
     loop {
         if let Some(status) = ffmpeg.try_wait()? {
-            let _ = helper.kill();
-            let _ = helper.wait();
             return Ok(status);
         }
-        if let Some(status) = helper.try_wait()? {
-            eprintln!("mic helper exited ({status}); stopping ffmpeg so both restart together.");
-            let _ = ffmpeg.kill();
-            let _ = ffmpeg.wait();
-            return Ok(ExitStatus::from_raw(1 << 8));
+        if !stop() {
+            if let Some(status) = helper.as_mut().map(|h| h.try_wait()).transpose()?.flatten() {
+                eprintln!("mic helper exited ({status}); stopping ffmpeg so both restart together.");
+                let _ = ffmpeg.kill();
+                let _ = ffmpeg.wait();
+                return Ok(ExitStatus::from_raw(1 << 8));
+            }
+        } else {
+            match asked_at {
+                None => {
+                    let _ = Command::new("kill").args(["-INT", &ffmpeg.id().to_string()]).status();
+                    asked_at = Some(Instant::now());
+                }
+                Some(t) if t.elapsed() >= grace => {
+                    eprintln!("ffmpeg did not stop within {}s (its output is probably stuck); killing it.", grace.as_secs());
+                    let _ = ffmpeg.kill();
+                }
+                Some(_) => {}
+            }
         }
-        std::thread::sleep(std::time::Duration::from_millis(250));
+        std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Hide the stream key (last path segment) of every rtmp(s):// URL in `arg`,
+/// including URLs embedded in a tee spec. The echo of the command is shown on
+/// screen, which may be the screen being streamed.
+fn mask_stream_keys(arg: &str) -> String {
+    let mut out = String::new();
+    let mut rest = arg;
+    while let Some(start) = rest.find("rtmp") {
+        let (head, tail) = rest.split_at(start);
+        out.push_str(head);
+        if tail.starts_with("rtmp://") || tail.starts_with("rtmps://") {
+            let end = tail.find(['|', ']', ' ']).unwrap_or(tail.len());
+            let (url, after) = tail.split_at(end);
+            out.push_str(&crate::streams::mask_rtmp_url(url));
+            rest = after;
+        } else {
+            out.push_str("rtmp");
+            rest = &tail["rtmp".len()..];
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn shell_join(argv: &[String]) -> String {
     argv.iter()
+        .map(|a| mask_stream_keys(a))
         .map(|a| if a.chars().any(|c| c.is_whitespace() || c == ';' || c == '[' || c == ']') {
             format!("'{a}'")
         } else {
@@ -664,7 +778,7 @@ mod tests {
         let joined = argv.join(" ");
         assert!(joined.contains("force_original_aspect_ratio=increase"), "{joined}");
         assert!(joined.contains("crop=1920:1080"), "{joined}");
-        assert!(joined.contains("overlay="), "expected overlay filter: {joined}");
+        assert!(joined.contains("overlay@cam="), "expected camera overlay: {joined}");
         assert!(joined.contains("-capture_cursor"), "{joined}");
     }
 
@@ -673,6 +787,35 @@ mod tests {
         assert_eq!(matched_width(1080, (3584, 2016)), 1920); // 16:9 monitor unchanged
         assert_eq!(matched_width(1080, (2560, 1664)), 1662); // 16:10 MacBook
         assert_eq!(matched_width(1080, (2940, 1912)) % 2, 0);
+    }
+
+    #[test]
+    fn echoed_command_hides_the_stream_key() {
+        let plain = vec!["-f".to_string(), "fifo".to_string(), "rtmp://a.rtmp.youtube.com/live2/SECRET-KEY".to_string()];
+        let echo = shell_join(&plain);
+        assert!(!echo.contains("SECRET-KEY") && echo.contains("rtmp://a.rtmp.youtube.com/live2/****"), "{echo}");
+        let tee = vec!["[f=fifo:x=1]rtmps://live.example/app/SECRET-KEY|[f=mp4]out.mp4".to_string()];
+        let echo = shell_join(&tee);
+        assert!(!echo.contains("SECRET-KEY") && echo.contains("|[f=mp4]out.mp4"), "{echo}");
+    }
+
+    #[test]
+    fn stretch_fit_fills_the_canvas_without_crop_or_pad() {
+        let mut cfg = test_cfg();
+        cfg.screen.fit = "stretch".into();
+        let joined = build_argv(&cfg).unwrap().join(" ");
+        assert!(joined.contains("scale=1920:1080:flags=bilinear,setsar=1"), "{joined}");
+        assert!(!joined.contains("crop=1920:1080") && !joined.contains("pad="), "{joined}");
+    }
+
+    #[test]
+    fn blur_fit_keeps_the_full_screen_on_a_fixed_canvas() {
+        let mut cfg = test_cfg();
+        cfg.screen.fit = "blur".into();
+        let joined = build_argv(&cfg).unwrap().join(" ");
+        assert!(joined.contains("boxblur") && joined.contains("overlay=(W-w)/2:(H-h)/2"), "{joined}");
+        assert!(joined.contains("force_original_aspect_ratio=decrease"), "{joined}");
+        assert!(!joined.contains("crop=1920:1080"), "{joined}");
     }
 
     #[test]
@@ -703,6 +846,7 @@ mod tests {
         // silently ignored by `-f flv`, so the muxer itself must be fifo).
         assert!(joined.contains("-f fifo -fifo_format flv"), "{joined}");
         assert!(joined.contains("-drop_pkts_on_overflow 0"), "{joined}");
+        assert!(joined.contains("-max_recovery_attempts 10"), "{joined}");
         assert!(joined.contains("-attempt_recovery 1"), "{joined}");
         assert!(joined.contains("-restart_with_keyframe 1"), "{joined}");
         // Timestamp repair + corrupt-packet tolerance on inputs (no nobuffer,
@@ -769,7 +913,7 @@ mod tests {
         assert!(joined.contains("[0:v]setpts=PTS-@MIC_ORIGIN@/TB,scale="), "{joined}");
         assert!(joined.contains("[2:a]aresample=48000,highpass"), "{joined}");
         // The camera shares the host clock, so it is re-based the same way.
-        assert!(joined.contains("[1:v]setpts=PTS-@MIC_ORIGIN@/TB,scale=320:180"), "{joined}");
+        assert!(joined.contains("[1:v]setpts=PTS-@MIC_ORIGIN@/TB,scale@cam=320:180"), "{joined}");
         assert!(!joined.contains("first_pts"), "{joined}");
         assert!(!joined.contains("-f avfoundation -i :"), "{joined}");
     }
@@ -800,6 +944,37 @@ mod tests {
     fn videotoolbox_falls_back_to_software_instead_of_dying() {
         let joined = build_argv(&test_cfg()).unwrap().join(" ");
         assert!(joined.contains("-allow_sw 1"), "{joined}");
+    }
+
+    #[test]
+    fn a_stuck_ffmpeg_is_killed_after_the_grace_period() {
+        // Ignores SIGINT like an ffmpeg wedged on a dead network write.
+        let mut child = Command::new("sh").args(["-c", "trap '' INT; sleep 30"]).spawn().unwrap();
+        let started = Instant::now();
+        let status = wait_for(&mut child, None, || true, Duration::from_millis(300)).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(status.code(), None, "expected death by signal, got {status}");
+    }
+
+    #[test]
+    fn a_cooperative_ffmpeg_stops_on_sigint_without_being_killed() {
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let status = wait_for(&mut child, None, || true, Duration::from_secs(30)).unwrap();
+        assert_eq!(status.signal(), Some(2), "{status}");
+    }
+
+    #[test]
+    fn gain_is_named_and_applied_before_the_limiter() {
+        let flat = build_argv(&test_cfg()).unwrap().join(" ");
+        assert!(flat.contains("volume@mic=0dB,"), "named so a live command can change it: {flat}");
+
+        let mut cfg = test_cfg();
+        cfg.audio.mic_gain_db = 6.0;
+        cfg.audio.system_device = "1".into();
+        cfg.audio.system_gain_db = -4.5;
+        let joined = build_argv(&cfg).unwrap().join(" ");
+        assert!(joined.contains("volume@mic=6dB,aformat=sample_rates=48000:channel_layouts=stereo,alimiter"), "{joined}");
+        assert!(joined.contains("volume@sys=-4.5dB,aformat"), "{joined}");
     }
 
     #[test]

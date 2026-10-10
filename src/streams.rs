@@ -26,6 +26,10 @@ pub struct StreamRecord {
     /// (all new streams). False for pre-supervisor records (raw ffmpeg pid).
     #[serde(default)]
     pub supervised: bool,
+    /// FIFO that feeds ffmpeg's interactive command input (see
+    /// `send_command`). None for streams started before live control existed.
+    #[serde(default)]
+    pub control: Option<String>,
 }
 
 /// Restart policy for a stream run, resolved from config + `start` flags.
@@ -279,39 +283,26 @@ pub fn spawn_detached(
         .try_clone()
         .with_context(|| format!("failed to clone {}", log_path.display()))?;
 
-    let supervised = retry.enabled;
-    // The mic helper and ffmpeg must start and stop together, which only the
-    // supervisor script does. Without retries it gives up after one run.
-    let pid = if supervised || mic.is_some() {
-        let policy = if supervised { retry } else { RetryPolicy { max_retries: Some(0), ..retry } };
-        let script = write_supervisor(&id, argv, &policy, &log_path, mic)?;
-        // nohup + stdin /dev/null: survives CLI exit and terminal hangup.
-        // (macOS ships nohup but not setsid.)
-        let child = Command::new("nohup")
-            .arg("bash")
-            .arg(&script)
-            .stdin(Stdio::null())
-            .stdout(log_out)
-            .stderr(log_err)
-            .spawn()
-            .context("failed to spawn stream supervisor (is bash installed?)")?;
-        let pid = child.id();
-        // Detach: never wait/reap; the supervisor outlives this CLI process.
-        std::mem::forget(child);
-        pid
-    } else {
-        let child = Command::new("ffmpeg")
-            .args(argv)
-            .stdin(Stdio::null())
-            .stdout(log_out)
-            .stderr(log_err)
-            .spawn()
-            .context("failed to spawn ffmpeg (is it installed?)")?;
-        let pid = child.id();
-        // Detach: never wait/reap; the stream outlives this CLI process.
-        std::mem::forget(child);
-        pid
-    };
+    // Every detached stream runs under the supervisor script: it restarts
+    // ffmpeg when retries are on, keeps the mic helper and ffmpeg together,
+    // and owns the control FIFO that lets the GUI change a live stream.
+    // Without retries it gives up after one run.
+    let policy = if retry.enabled { retry } else { RetryPolicy { max_retries: Some(0), ..retry } };
+    let script = write_supervisor(&id, argv, &policy, &log_path, mic)?;
+    // nohup + stdin /dev/null: survives CLI exit and terminal hangup.
+    // (macOS ships nohup but not setsid.)
+    let child = Command::new("nohup")
+        .arg("bash")
+        .arg(&script)
+        .stdin(Stdio::null())
+        .stdout(log_out)
+        .stderr(log_err)
+        .spawn()
+        .context("failed to spawn stream supervisor (is bash installed?)")?;
+    let pid = child.id();
+    // Detach: never wait/reap; the supervisor outlives this CLI process.
+    std::mem::forget(child);
+    let control = control_fifo(&id);
 
     let rec = StreamRecord {
         name: name
@@ -326,11 +317,46 @@ pub fn spawn_detached(
         output: format!("{}x{}@{}", cfg.video.width, cfg.video.height, cfg.video.fps),
         snapshot_path: snap_path.display().to_string(),
         log_path: log_path.display().to_string(),
-        supervised,
+        supervised: true,
+        control: Some(control.display().to_string()),
     };
     alive.push(rec.clone());
     save_state(&alive)?;
     Ok(rec)
+}
+
+/// Where a stream's live-command FIFO lives.
+fn control_fifo(id: &str) -> PathBuf {
+    snapshots_dir().join(format!("stream-{id}-ctl.fifo"))
+}
+
+/// `O_NONBLOCK` on macOS: opening a FIFO nobody reads must fail, not hang.
+const O_NONBLOCK: i32 = 0x0004;
+
+/// Send one live command to a running stream's ffmpeg, for example
+/// `overlay@cam x 100`. ffmpeg applies it to the matching filter without
+/// restarting, so viewers see no reconnect. Errors say what is missing.
+pub fn send_command(rec: &StreamRecord, command: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = rec.control.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "stream {} was started before live control existed. End it and start it again to enable live changes.",
+            rec.id
+        )
+    })?;
+    let mut fifo = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("stream {} is not listening for live changes ({path} cannot be opened)", rec.id))?;
+    // ffmpeg's interactive 'c' key, then "<target> <time|-1> <command> <arg>".
+    // Callers write "<target> <command> <arg>"; -1 means "apply now".
+    let (target, rest) = command
+        .split_once(' ')
+        .ok_or_else(|| anyhow::anyhow!("live command {command:?} needs a target and a command, like `overlay@cam x 100`"))?;
+    fifo.write_all(format!("c{target} -1 {rest}\n").as_bytes())
+        .with_context(|| format!("could not send the change to stream {}", rec.id))
 }
 
 /// Stream logs are trimmed to the last `KEEP_LOG_BYTES` once they pass `MAX_LOG_BYTES`.
@@ -351,8 +377,19 @@ fn write_supervisor(
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create {}", dir.display()))?;
     let path = dir.join(format!("stream-{id}-supervisor.sh"));
+    let ctl = control_fifo(id);
+    let ctl_q = shell_escape(&ctl.display().to_string());
+    let mic_fifo_path = dir.join(format!("stream-{id}-mic.fifo")).display().to_string();
+    // Under the supervisor ffmpeg's stdin carries live commands, so the mic
+    // PCM arrives through its own FIFO as a file input instead of `pipe:0`,
+    // and `-nostdin` must go.
     let ffmpeg_cmd = std::iter::once("ffmpeg".to_string())
-        .chain(argv.iter().map(|a| shell_escape_origin(a)))
+        .chain(
+            argv.iter()
+                .filter(|a| mic.is_none() || a.as_str() != "-nostdin")
+                .map(|a| if mic.is_some() && a == "pipe:0" { mic_fifo_path.clone() } else { a.clone() })
+                .map(|a| shell_escape_origin(&a)),
+        )
         .collect::<Vec<_>>()
         .join(" ");
     let max = retry
@@ -365,16 +402,20 @@ fn write_supervisor(
     // has no `wait -n`, so poll; whichever side dies first takes the other
     // down and counts as a failure, so the retry loop restarts both.
     let (fifo_setup, fifo_cleanup, run) = match mic {
-        None => (String::new(), String::new(), format!("{ffmpeg_cmd} >> {log} 2>&1\nCODE=$?\n")),
+        None => (
+            String::new(),
+            String::new(),
+            format!("{ffmpeg_cmd} <&7 >> {log} 2>&1\nCODE=$?\n"),
+        ),
         Some(mic) => {
-            let fifo = shell_escape(&dir.join(format!("stream-{id}-mic.fifo")).display().to_string());
+            let fifo = shell_escape(&mic_fifo_path);
             let helper = shell_escape(&mic.exe.display().to_string());
             let device = shell_escape(&mic.device);
             let run = format!(
                 "MIC_ORIGIN=$({helper} now)\n\
                  {helper} {device} \"$MIC_ORIGIN\" > {fifo} 2>> {log} &\n\
                  HP=$!\n\
-                 {ffmpeg_cmd} < {fifo} >> {log} 2>&1 &\n\
+                 {ffmpeg_cmd} <&7 >> {log} 2>&1 &\n\
                  FP=$!\n\
                  while kill -0 $HP 2>/dev/null && kill -0 $FP 2>/dev/null; do sleep 1; done\n\
                  if kill -0 $FP 2>/dev/null; then\n\
@@ -400,6 +441,10 @@ fn write_supervisor(
             )
         }
     };
+    // Control FIFO, held open read+write on fd 7 so writers never block and
+    // ffmpeg never sees end-of-file on its stdin.
+    let fifo_setup = format!("rm -f {ctl_q}; mkfifo {ctl_q}\nexec 7<>{ctl_q}\n{fifo_setup}");
+    let fifo_cleanup = format!("{fifo_cleanup}; rm -f {ctl_q}");
     let text = format!(
         "#!/bin/bash\n\
          # minicast supervisor for stream {id} — restarts ffmpeg after failures.\n\
@@ -531,8 +576,12 @@ pub fn remove_record(id_or_name: &str) -> Result<Option<StreamRecord>> {
             kept.push(r);
         }
     }
-    if removed.is_some() {
+    if let Some(rec) = &removed {
         save_state(&kept)?;
+        // A supervisor killed by SIGTERM cannot clean up its own FIFO.
+        if let Some(control) = &rec.control {
+            let _ = std::fs::remove_file(control);
+        }
     }
     Ok(removed)
 }
@@ -581,6 +630,7 @@ mod tests {
             snapshot_path: "/tmp/snap.toml".into(),
             log_path: "/tmp/s.log".into(),
             supervised: true,
+            control: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let back: StreamRecord = serde_json::from_str(&json).unwrap();
@@ -657,6 +707,114 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    fn record_with_control(control: Option<String>) -> StreamRecord {
+        StreamRecord {
+            id: "7".into(),
+            name: "t".into(),
+            pid: 1,
+            rtmp_url: String::new(),
+            platform: String::new(),
+            started_at: 0,
+            output: String::new(),
+            snapshot_path: String::new(),
+            log_path: String::new(),
+            supervised: true,
+            control,
+        }
+    }
+
+    #[test]
+    fn live_commands_reach_the_control_fifo() {
+        use std::io::Read;
+        let fifo = std::env::temp_dir().join(format!("mc-ctl-test-{}.fifo", std::process::id()));
+        let _ = std::fs::remove_file(&fifo);
+        assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        let rec = record_with_control(Some(fifo.display().to_string()));
+        // Nobody is reading yet: sending must fail fast, not hang.
+        assert!(send_command(&rec, "overlay@cam x 1").is_err());
+        let reader_path = fifo.clone();
+        let reader = std::thread::spawn(move || {
+            let mut text = String::new();
+            std::fs::File::open(reader_path).unwrap().read_to_string(&mut text).unwrap();
+            text
+        });
+        // Retry until the reader has the FIFO open.
+        let sent = (0..100).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            send_command(&rec, "overlay@cam x 100").is_ok()
+        });
+        assert!(sent, "command never reached the reader");
+        assert_eq!(reader.join().unwrap(), "coverlay@cam -1 x 100\n");
+        std::fs::remove_file(&fifo).ok();
+    }
+
+    /// End to end through a real supervisor and ffmpeg: moving and resizing
+    /// the camera box and changing the volume mid-run must all be accepted.
+    /// Needs ffmpeg, so run with `cargo test -- --ignored live_changes`.
+    #[test]
+    #[ignore = "needs ffmpeg"]
+    fn live_changes_reach_a_running_supervised_ffmpeg() {
+        let out = std::env::temp_dir().join("mc-live-e2e.mkv");
+        let argv: Vec<String> = [
+            "-hide_banner", "-loglevel", "info", "-re",
+            "-f", "lavfi", "-i", "color=c=0x202020:s=1280x720:r=30",
+            "-f", "lavfi", "-i", "testsrc2=s=640x360:r=30",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
+            "-filter_complex",
+            "[1:v]scale@cam=160:90:force_original_aspect_ratio=increase,crop@cam=160:90[c];\
+             [0:v][c]overlay@cam=20:20[v];[2:a]volume@mic=0dB[a]",
+            "-map", "[v]", "-map", "[a]", "-t", "8", "-y", "-f", "matroska",
+        ]
+        .map(String::from)
+        .into_iter()
+        .chain([out.display().to_string()])
+        .collect();
+        let retry = RetryPolicy { enabled: false, max_retries: Some(0), base_secs: 1, cap_secs: 1 };
+        let log = std::env::temp_dir().join("mc-live-e2e.log");
+        // The supervisor appends, so start from an empty log.
+        let _ = std::fs::remove_file(&log);
+        let script = write_supervisor("selftest-995", &argv, &retry, &log, None).unwrap();
+        let mut child = Command::new("bash").arg(&script).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let rec = record_with_control(Some(control_fifo("selftest-995").display().to_string()));
+        for command in [
+            "scale@cam w 480", "scale@cam h 270", "crop@cam w 480", "crop@cam h 270",
+            "overlay@cam x 700", "overlay@cam y 300", "volume@mic volume -12dB",
+        ] {
+            send_command(&rec, command).unwrap();
+        }
+        assert!(child.wait().unwrap().success());
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        let replies = text.matches("ret:0").count();
+        std::fs::remove_file(&script).ok();
+        std::fs::remove_file(&out).ok();
+        assert_eq!(replies, 7, "expected seven accepted commands in the ffmpeg log, got:\n{text}");
+    }
+
+    #[test]
+    fn streams_from_before_live_control_say_so() {
+        let err = send_command(&record_with_control(None), "overlay@cam x 1").unwrap_err();
+        assert!(format!("{err}").contains("started before live control"), "{err}");
+    }
+
+    #[test]
+    fn supervisor_frees_stdin_for_commands_and_moves_the_mic_to_a_fifo() {
+        let retry = RetryPolicy { enabled: true, max_retries: None, base_secs: 2, cap_secs: 30 };
+        let argv: Vec<String> = ["-nostdin", "-copyts", "-f", "f32le", "-i", "pipe:0", "-t", "1"].map(String::from).into();
+        let mic = crate::mic::MicCapture { exe: "/x/miccap".into(), device: "Mic".into() };
+        let log = std::env::temp_dir().join("mc-supervisor-ctl-test.log");
+        let path = write_supervisor("selftest-997", &argv, &retry, &log, Some(&mic)).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("-nostdin"), "{text}");
+        assert!(!text.contains("pipe:0"), "{text}");
+        assert!(text.contains("-i ") && text.contains("-mic.fifo"), "{text}");
+        let plain = write_supervisor("selftest-996", &["-t".to_string(), "1".to_string()], &retry, &log, None).unwrap();
+        let plain_text = std::fs::read_to_string(&plain).unwrap();
+        assert!(plain_text.contains("exec 7<>") && plain_text.contains("<&7"), "{plain_text}");
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&plain).ok();
+    }
+
     #[test]
     fn supervisor_pipes_the_mic_helper_into_ffmpeg() {
         let retry = RetryPolicy { enabled: true, max_retries: None, base_secs: 2, cap_secs: 30 };
@@ -669,7 +827,10 @@ mod tests {
         assert!(text.contains("MIC_ORIGIN=$('/x/mic cap' now)"), "{text}");
         // Fresh origin per attempt, spliced into the filter string as a variable.
         assert!(text.contains("'[0:v]setpts=PTS-'\"$MIC_ORIGIN\"'/TB,scale=1:1[v]'"), "{text}");
-        assert!(text.contains("< "), "{text}");
+        // Live commands arrive on stdin (fd 7); the mic PCM comes through its own FIFO.
+        assert!(text.contains("<&7"), "{text}");
+        assert!(text.contains("exec 7<>"), "{text}");
+        assert!(text.contains("-ctl.fifo"), "{text}");
         assert!(text.contains("mic helper exited"), "{text}");
         let check = std::process::Command::new("bash").arg("-n").arg(&path).status().unwrap();
         assert!(check.success(), "supervisor script failed bash -n");

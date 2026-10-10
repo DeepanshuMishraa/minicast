@@ -5,6 +5,8 @@ compile_error!("minicast is macOS-only for now (AVFoundation + VideoToolbox)");
 mod config;
 mod devices;
 mod ffmpeg;
+#[cfg(feature = "gui")]
+mod gui;
 mod help;
 mod mic;
 mod streams;
@@ -54,7 +56,7 @@ enum Cmd {
         /// Screen device index or name, e.g. "1" or "Capture screen 0"
         #[arg(long)]
         screen: Option<String>,
-        /// Screen fit: match (canvas follows screen aspect, default) | cover (fill, crop) | contain (letterbox)
+        /// Screen fit: match (canvas follows screen aspect, default) | stretch (16:9 canvas, whole screen, slightly widened) | blur (16:9 canvas, blurred side fill) | cover (fill, crop) | contain (letterbox)
         #[arg(long)]
         screen_fit: Option<String>,
         /// Capture cursor: true | false
@@ -84,6 +86,12 @@ enum Cmd {
         /// Mic DSP preset: standard | voice (suppression) | wide (music)
         #[arg(long)]
         mic_mode: Option<String>,
+        /// Mic level in dB, -30 to 30 (0 = untouched)
+        #[arg(long, allow_negative_numbers = true)]
+        mic_gain: Option<f32>,
+        /// System audio level in dB, -30 to 30 (0 = untouched)
+        #[arg(long, allow_negative_numbers = true)]
+        system_gain: Option<f32>,
         /// System audio device index or name (needs BlackHole etc). Use "off" to disable.
         #[arg(long)]
         system_audio: Option<String>,
@@ -118,6 +126,8 @@ enum Cmd {
         #[arg(long)]
         max_retry_delay: Option<u64>,
     },
+    /// Open the setup + preview window (needs a build with `--features gui`)
+    Gui,
     /// Validate the config file
     #[command(long_about = "Validate the config file without streaming.\n\nChecks the RTMP URL, resolution/fps, mic presence, encoder, PiP\nplacement and retry settings, then prints the resolved summary.\nRun this before going live.")]
     Validate,
@@ -248,6 +258,8 @@ fn main() -> Result<()> {
             camera_filter,
             mic,
             mic_mode,
+            mic_gain,
+            system_gain,
             system_audio,
             resolution,
             fps,
@@ -271,6 +283,8 @@ fn main() -> Result<()> {
                 && camera_filter.is_none()
                 && mic.is_none()
                 && mic_mode.is_none()
+                && mic_gain.is_none()
+                && system_gain.is_none()
                 && system_audio.is_none()
                 && resolution.is_none()
                 && fps.is_none()
@@ -356,8 +370,8 @@ fn main() -> Result<()> {
 
             if let Some(v) = screen_fit.as_deref() {
                 match v.to_lowercase().as_str() {
-                    "match" | "cover" | "contain" => cfg.screen.fit = v.to_lowercase(),
-                    _ => bail!("--screen-fit must be match|cover|contain"),
+                    "match" | "stretch" | "blur" | "cover" | "contain" => cfg.screen.fit = v.to_lowercase(),
+                    _ => bail!("--screen-fit must be match|stretch|blur|cover|contain"),
                 }
             }
             if let Some(v) = cursor.as_deref() {
@@ -395,6 +409,12 @@ fn main() -> Result<()> {
                     }
                     _ => bail!("--camera-filter must be off|standard|studio|lowlight"),
                 }
+            }
+            if let Some(v) = mic_gain {
+                cfg.audio.mic_gain_db = v;
+            }
+            if let Some(v) = system_gain {
+                cfg.audio.system_gain_db = v;
             }
             if let Some(v) = mic_mode.as_deref() {
                 match v.to_lowercase().as_str() {
@@ -477,6 +497,12 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Cmd::Gui => {
+            #[cfg(feature = "gui")]
+            gui::run();
+            #[cfg(not(feature = "gui"))]
+            bail!("this build has no GUI. Rebuild with `cargo install --path . --features gui`.");
+        }
         Cmd::Validate => {
             let mut cfg = config::Config::load(&cfg_path)?;
             ffmpeg::resolve_media(&mut cfg)?;
@@ -556,6 +582,10 @@ fn main() -> Result<()> {
                 println!(
                     "snapshot taken — editing {} won't affect this stream.",
                     cfg_path.display()
+                );
+                println!(
+                    "warning: ffmpeg prints your full stream key in this terminal. If this screen is \
+                     on stream, use `minicast start --detach` (output goes to a log file) instead."
                 );
                 if retry.enabled {
                     match retry.max_retries {
@@ -705,10 +735,15 @@ fn truncate(s: &str, max: usize) -> String {
 /// Foreground run with auto-retry: a clean exit (code 0) or a signal death
 /// stops the loop; any other failure sleeps with backoff and restarts.
 fn run_foreground(argv: &[String], mic: Option<&mic::MicCapture>, retry: streams::RetryPolicy) -> Result<()> {
+    ffmpeg::install_interrupt_handler()?;
     let mut attempt: u32 = 0;
     loop {
         let started = streams::unix_now();
         let status = ffmpeg::run_once(argv, mic)?;
+        if ffmpeg::interrupted() {
+            println!("stopped.");
+            return Ok(());
+        }
         if status.success() {
             println!("ffmpeg exited cleanly — stream over.");
             return Ok(());
